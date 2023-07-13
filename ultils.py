@@ -7,6 +7,25 @@ from rank_bm25 import BM25Okapi
 import traceback
 import json
 
+import transformers
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorWithPadding,
+    EvalPrediction,
+    HfArgumentParser,
+    PretrainedConfig,
+    Trainer,
+    TrainingArguments,
+    default_data_collator,
+    set_seed,
+)
+from datasets import load_dataset
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils import check_min_version
+from transformers.utils.versions import require_version
+
 def get_article(line):
     line = line.lower()
     article_num_text = line.split(".")[0]
@@ -156,12 +175,42 @@ def get_pred_from_laws(quest,bm25,laws_list):
     pos = np.argmax(quest_score)
     return laws_list[pos]
 
-def load_quest_from_json(filename):
+def load_data_from_json(filename):
     with open(filename,'r',encoding='utf-8') as f:
         data = json.load(f)
     # print(data)
 
     return data
+
+def load_quest_from_json(filename,laws):
+    data = load_data_from_json(filename)
+    quests = []
+    for row in data:
+        instance = {}
+        instance["id"] = row["quest_id"]
+        instance["type"] = row["question_type"]
+        instance["quest"] = row["text"]
+        articles=[]
+        if "relevant_articles" in row:
+            for article in row["relevant_articles"]:
+                art = article["article_id"].lower()
+                law = article["law_id"].lower()
+                law_id = get_law_id(law)
+                # articles.append("{}-{}".format(law_id,art))
+                key = "{}-{}".format(law_id,art)
+                text = laws[key]
+                articles.append(key,text)
+            instance["articles"]=articles
+        if "answer" in row:
+            answer = row["answer"]
+            instance["answer"]=answer
+        if "choices" in row:
+            instance["A"] = row["choices"]["A"]
+            instance["B"] = row["choices"]["B"]
+            instance["C"] = row["choices"]["C"]
+            instance["D"] = row["choices"]["D"]
+        quests.append(instance)
+    return quests
 
 def run():
     laws = load_all_laws()
@@ -197,8 +246,6 @@ def run():
                             continue
                         else:
                             art=int(row[2])
-                    
-                    
                     if row[0]!="Trắc nghiệm":
                         TF_Y = collect_quest_and_law(row[1],art,TF_Y)
                         TF_quest.append(row[3])
@@ -237,30 +284,8 @@ def run():
         except:
             traceback.print_exception(*sys.exc_info())
             continue
-def using_bert_model():
-    from transformers import AutoTokenizer, T5EncoderModel
-    model_config = "thaingo/vietAI-vit5-base-law"
-    # model_config = "t5-small"
-    tokenizer = AutoTokenizer.from_pretrained(model_config)
-    model = T5EncoderModel.from_pretrained(model_config)
-    input_ids = tokenizer(    "Studies have been shown that owning a dog is good for you", return_tensors="pt").input_ids  # Batch size 1
-    outputs = model(input_ids=input_ids)
-    last_hidden_states = outputs.last_hidden_state
 
-def run_json_task1():
-    laws = load_all_laws()
-    tokenized_laws = []
-    laws_list = list(laws.keys())
-    ########## corpus with original laws
-    for key in laws:
-        tokenized_laws.append(laws[key].split(" "))
-    ########## corpus with tokenized laws
-    # tokenized_laws = create_corpus_from_dict(laws)
-    bm25 = BM25Okapi(tokenized_laws)
-    data = load_quest_from_json("train_data/train.json")
-    
-    
-    
+def get_law_id(law_name):
     laws_name=[
         "HIẾN PHÁP",
         "BỘ LUẬT DÂN SỰ",
@@ -281,21 +306,41 @@ def run_json_task1():
         "LUẬT TIẾP CẬN THÔNG TIN"
     ]
     normed_laws_name = [name.lower() for name in laws_name]
-    print(normed_laws_name)
+    # print(normed_laws_name)
+    id = normed_laws_name.index(law_name) +1
+    return id
+
+def run_json_task1():
+    laws = load_all_laws()
+    tokenized_laws = []
+    laws_list = list(laws.keys())
+    ########## corpus with original laws
+    for key in laws:
+        tokenized_laws.append(laws[key].split(" "))
+    ########## corpus with tokenized laws
+    # tokenized_laws = create_corpus_from_dict(laws)
+    bm25 = BM25Okapi(tokenized_laws)
+    data = load_data_from_json("train_data/public_test_GOLD.json")
+    
+    
     TF_Y = []
     TF_quest = []
     TN_quest = []
     TN_Y = []
     for row in data:
         type = row["question_type"]
-        art = row["relevant_articles"][0]["article_id"]
-        law = row["relevant_articles"][0]["law_id"].lower()
-        law_id = normed_laws_name.index(law) +1
+        Ys = []
+        for article in row["relevant_articles"]:
+
+            art = article["article_id"]
+            law = article["law_id"].lower()
+            law_id = get_law_id(law)
+            Ys.append("{}-{}".format(law_id,art))
         if type!="Trắc nghiệm":
-            TF_Y = collect_quest_and_law(str(law_id),art,TF_Y)
+            TF_Y.append(Ys)
             TF_quest.append(row["text"])
         else:
-            TN_Y = collect_quest_and_law(str(law_id),art,TN_Y)
+            TN_Y.append(Ys)
             TN_quest.append((row["text"],row["choices"]["A"],row["choices"]["B"],row["choices"]["C"],row["choices"]["D"]))
     TF_pred_law = []
     TN_pred_law = []
@@ -326,7 +371,32 @@ def run_json_task1():
     Y = TF_Y + TN_Y 
     compare_res(pred,Y,laws)
 
+def using_bert_model():
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    # model_config = "thaingo/vietAI-vit5-base-law"
+    # model_config = "t5-small"
+    model_config = "vinai/phobert-base-v2"
+    tokenizer = AutoTokenizer.from_pretrained(model_config)
+    model = AutoModelForSequenceClassification.from_pretrained(model_config)
+    input_ids = tokenizer(    "Studies have been shown that owning a dog is good for you", return_tensors="pt").input_ids  # Batch size 1
+    outputs = model(input_ids=input_ids)
+    last_hidden_states = outputs.last_hidden_state
+
+def train():
+    # model_config = "thaingo/vietAI-vit5-base-law"
+    # model_config = "t5-small"
+    model_config = "vinai/phobert-base-v2"
+    tokenizer = AutoTokenizer.from_pretrained(model_config)
+    model = AutoModelForSequenceClassification.from_pretrained(model_config)
+    laws = load_all_laws()
+    quests = load_quest_from_json("train_data/train.json",laws)
+    data = load_dataset(quests)
+    return None
+
+
+
 if __name__=="__main__":
     # load_csv("An.csv")
-    run()
+    # run()
     # run_json_task1()
+    train()
